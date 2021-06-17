@@ -1,0 +1,139 @@
+import sys
+
+FILES, = glob_wildcards("{file}.fastq")
+if len(FILES) == 0:
+    sys.exit()
+
+BARCODES = config["barcodes"]
+
+REFERENCE = "/mnt/StudentFiles/2020-21/Project5/data/covid/NC_045512.2.fasta"
+REFERENCE_GFF = "/mnt/StudentFiles/2020-21/Project5/data/covid/NC_045512.2_edited.gff3"
+HG38 = "/mnt/StudentFiles/2020-21/Project5/data/GRCh38_latest_genomic.fna"
+COVERAGE = ["30"]
+
+rule all:
+    input: 
+        expand("consensus_{coverage}x.fasta", coverage=COVERAGE)
+        
+rule demux_files:
+    priority: 7
+    input:
+        "fastq_pass/{file}.fastq"
+    output:
+        barcode = expand("separate/{{file}}/BC{bc}.fastq", bc=BARCODES)
+    params:
+        barcodes = expand("BC{bc}_NBD196", bc=BARCODES)
+    threads: 1
+    shell:
+        """
+        /mnt/StudentFiles/2020-21/Project5/Porechop/porechop-runner.py -i {input} -b separate/{wildcards.file} \
+        --format fastq --require_two_barcodes --discard_unassigned -t {threads} -v 0 -l {params.barcodes}
+        touch {output.barcode}
+        """
+
+rule merge_barcodes:
+    priority: 6
+    input:
+        expand("separate/{file}/BC{{bc}}.fastq", file=FILES)
+    output:
+        "demultiplexed/barcode{bc,\d+}.fastq"
+    threads: 1
+    shell:
+        """
+        cat {input} > {output}
+        """
+        
+rule cut_adapters:
+    priority: 5
+    input:
+        "demultiplexed/barcode{bc}.fastq"
+    output:
+        "trimmed/barcode{bc}_trimmed.fastq"
+    threads: 1
+    shell:
+        """
+        cutadapt -u 30 -u -30 -o {output} {input} -m 75 -j {threads} --quiet
+        """
+
+rule filter_human_out:
+    priority: 4
+    input:
+        trimmed_fastq="trimmed/barcode{bc}_trimmed.fastq",
+        reference=HG38
+    output:
+        "filtered/barcode{bc,\d+}_filtered.fastq"
+    threads: 8
+    shell:
+        """
+        minimap2 -Y -t {threads} -x map-ont -a {input.reference} {input.trimmed_fastq} 2> /dev/null | samtools fastq -f 4 - 2> /dev/null > {output}
+        """
+
+rule map_to_reference:
+    priority: 3
+    input:
+        filtered_fastq="filtered/barcode{bc}_filtered.fastq",
+        reference=REFERENCE
+    output:
+        "mapped/barcode{bc,\d+}_mapped.bam"
+    threads: 4
+    shell:
+        """
+        minimap2 -Y -t {threads} -x map-ont -a {input.reference} {input.filtered_fastq} 2> /dev/null | samtools view -bF 4 - | samtools sort -@ {threads} - > {output}
+        """
+
+rule create_consensus:
+    priority: 2
+    input:
+        "mapped/barcode{bc}_mapped.bam"
+    output:
+        "consensus/barcode{bc,\d+}_consensus_{coverage,\d+}x.fasta"
+    threads: 1
+    shell:
+        """
+        samtools index -@ {threads} {input}
+        /mnt/StudentFiles/2020-21/Project5/covid_snake/helper_scripts/bam2consensus.py -i {input} -o {output} -d {wildcards.coverage} -g 1
+        """
+
+rule align_consensus:
+    priority: 1
+    input:
+        consensus="consensus/barcode{bc}_consensus_{coverage}x.fasta",
+        reference=REFERENCE
+    output:
+        "consensus_aligned/barcode{bc,\d+}_consensus_{coverage,\d+}x.fasta"
+    threads: 1
+    run:
+        #Maybe put any python code in a utils script folder?
+        from Bio import SeqIO
+        from Bio.Align import PairwiseAligner
+        
+        aligner = PairwiseAligner()
+        aligner.mode = 'global'
+        aligner.match_score = 1
+        aligner.mismatch_score = 0
+        aligner.open_gap_score = -2
+        aligner.extend_gap_score = -1
+
+        ref = SeqIO.read(input.reference,"fasta")
+        ref.seq = str(ref.seq.upper()).replace('-','N')
+        cons = SeqIO.read(input.consensus,"fasta")
+        aln = aligner.align(ref.seq,cons.seq)
+        with open(output[0],'w') as out:
+            print(">barcode"+wildcards.bc+"_consensus_"+wildcards.coverage+"x", file=out)
+            print(str(aln[0]).strip().split('\n')[2], file=out)
+
+rule gather_consensus_and_extract_genes:
+    priority: 0
+    input:
+        consensus=expand("consensus_aligned/barcode{bc}_consensus_{{coverage}}x.fasta", bc=BARCODES),
+        ref=REFERENCE,
+        ref_gff=REFERENCE_GFF
+    output:
+        outfile="consensus_{coverage,\d+}x.fasta"
+    threads: 1
+    shell:
+        """
+        cat {input.consensus} > tmp_consensus.fasta
+        Rscript --vanilla /mnt/StudentFiles/2020-21/Project5/covid_snake/extract_genes.R {input.ref_gff} {input.ref} tmp_consensus.fasta genes_{wildcards.coverage}x >/dev/null 2>&1
+        mv tmp_consensus.fasta {output}
+        """
